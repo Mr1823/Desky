@@ -211,6 +211,7 @@ static bool     gazeExternal  = false;   // true = the servo is steering it
 static uint32_t lastEaseAt    = 0;
 
 static bool     lively        = false;
+static bool     holdClosed    = false;   // touch-hold: eyes shut, nothing else changes
 static bool     slow          = false;
 static uint32_t nowMs         = 0;
 
@@ -291,6 +292,8 @@ void facesForceBlink() {
   secondBlink  = false;
 }
 
+void facesHoldEyesClosed(bool on) { holdClosed = on; }
+
 // =====================================================================
 //    facesUpdate() - all the timers. Called every loop, never blocks.
 // =====================================================================
@@ -369,23 +372,45 @@ static void drawFocusBrows(int16_t lx, int16_t rx, int16_t cy) {
   }
 }
 
-// The floating "Z z z" of a sleeping pet. Each letter is on the same
-// rising path, just a third of a cycle apart, so they chase each other.
+// A "Z" built from three lines. It is a SHAPE, not a text glyph: display A
+// never uses a font. (x, y) is the bottom-left corner, 'size' the box side.
+static void drawZ(int16_t x, int16_t y, int16_t size, uint8_t thick) {
+  for (uint8_t t = 0; t < thick; t++) {
+    u8g2.drawHLine(x, y - size + t, size + 1);               // top bar
+    u8g2.drawLine(x + size - t, y - size, x - t, y);         // diagonal
+    u8g2.drawHLine(x, y - t, size + 1);                      // bottom bar
+  }
+}
+
+// A question mark built from short line segments, also a shape and not a
+// glyph. (x, y) is the bottom-left corner; it is about 10 wide, 15 tall.
+static void drawQuestion(int16_t x, int16_t y) {
+  static const int8_t P[8][2] = {            // the hook, then the stem
+    {1, -11}, {3, -14}, {6, -14}, {8, -11}, {8, -9}, {5, -6}, {4, -5}, {4, -4}};
+  for (uint8_t t = 0; t < 2; t++) {          // two passes = 2 px thick
+    for (uint8_t i = 0; i < 7; i++)
+      u8g2.drawLine(x + P[i][0] + t, y + P[i][1], x + P[i + 1][0] + t, y + P[i + 1][1]);
+  }
+  u8g2.drawBox(x + 3, y - 1, 3, 2);          // the dot
+}
+
+// The floating "Z z z" of a sleeping pet. Each Z is on the same rising
+// path, just a third of a cycle apart, so they chase each other.
 static void drawSleepingZs(uint32_t now) {
-  const uint16_t period = 2400;
   for (uint8_t i = 0; i < 3; i++) {
-    uint32_t t = (now + (uint32_t)i * (period / 3)) % period;
-    // Kept above y=22 so the letters never cross the closed eyes below.
-    int16_t  x = 100 + (int16_t)(t * 18 / period);
-    int16_t  y = 22  - (int16_t)(t * 16 / period);
-    u8g2.setFont(i == 0 ? u8g2_font_10x20_tf : u8g2_font_6x10_tf);
-    u8g2.drawStr(x, y, "Z");
+    uint32_t t = (now + (uint32_t)i * (ZZZ_PERIOD_MS / 3)) % ZZZ_PERIOD_MS;
+    // Kept above y=22 so the Zs never cross the closed eyes below.
+    int16_t  x = 100 + (int16_t)(t * 18 / ZZZ_PERIOD_MS);
+    int16_t  y = 22  - (int16_t)(t * 16 / ZZZ_PERIOD_MS);
+    if (i == 0) drawZ(x, y, 9, 2);           // the big one
+    else        drawZ(x, y, 6, 1);           // two small ones
   }
 }
 
 static void drawFace(uint32_t now) {
   Expression       e = facesCurrent();
-  const FaceStyle &s = STYLES[e];
+  const FaceStyle &s = STYLES[e];                                   // mouth + props
+  const FaceStyle &es = holdClosed ? STYLES[EXP_SLEEPING] : s;      // eyes
 
   // ---- the "alive" offsets -----------------------------------------
   // breathing: the whole face drifts 1 px up and down, very slowly.
@@ -393,7 +418,7 @@ static void drawFace(uint32_t now) {
   int16_t bounce = lively ? wave(now, LIVELY_BOUNCE_MS, LIVELY_BOUNCE_PX) : 0;
   int16_t drift  = breath + bounce;
 
-  int16_t eyeCy   = EYE_CY + drift + s.eyeDY;
+  int16_t eyeCy   = EYE_CY + drift + es.eyeDY;
   int16_t mouthCy = MOUTH_CY + drift;
   int16_t lx      = EYE_L_CX + gazePx;      // eyes follow the gaze / the head
   int16_t rx      = EYE_R_CX + gazePx;
@@ -409,19 +434,19 @@ static void drawFace(uint32_t now) {
   int16_t rightPct = (e == EXP_CONFUSED) ? 55 : 100;
 
   // ---- eyes ---------------------------------------------------------
-  switch (s.eyeShape) {
+  switch (es.eyeShape) {
     case EYES_BOX: {
-      int16_t hl = max((int16_t)2, (int16_t)(s.eyeH * openPct / 100));
-      int16_t hr = max((int16_t)2, (int16_t)(s.eyeH * openPct / 100 * rightPct / 100));
-      drawRoundBox(lx, eyeCy, s.eyeW, hl, EYE_R);
-      drawRoundBox(rx, eyeCy, s.eyeW, hr, EYE_R);
-      if (e == EXP_SAD) eraseSadLids(lx, rx, eyeCy, s.eyeW, hl);
+      int16_t hl = max((int16_t)2, (int16_t)(es.eyeH * openPct / 100));
+      int16_t hr = max((int16_t)2, (int16_t)(es.eyeH * openPct / 100 * rightPct / 100));
+      drawRoundBox(lx, eyeCy, es.eyeW, hl, EYE_R);
+      drawRoundBox(rx, eyeCy, es.eyeW, hr, EYE_R);
+      if (e == EXP_SAD) eraseSadLids(lx, rx, eyeCy, es.eyeW, hl);
       if (e == EXP_FOCUS) drawFocusBrows(lx, rx, eyeCy);
       break;
     }
     case EYES_ARC:                      // happy / celebrating / eating
-      drawArc(lx, eyeCy + s.eyeH / 2, s.eyeW, s.eyeH, 4);
-      drawArc(rx, eyeCy + s.eyeH / 2, s.eyeW, s.eyeH, 4);
+      drawArc(lx, eyeCy + es.eyeH / 2, es.eyeW, es.eyeH, 4);
+      drawArc(rx, eyeCy + es.eyeH / 2, es.eyeW, es.eyeH, 4);
       break;
 
     case EYES_HEART: {                  // LOVED
@@ -431,8 +456,8 @@ static void drawFace(uint32_t now) {
       break;
     }
     case EYES_CLOSED:                   // SLEEPING
-      drawArc(lx, eyeCy, s.eyeW, s.eyeH, 3);
-      drawArc(rx, eyeCy, s.eyeW, s.eyeH, 3);
+      drawArc(lx, eyeCy, es.eyeW, es.eyeH, 3);
+      drawArc(rx, eyeCy, es.eyeW, es.eyeH, 3);
       break;
   }
 
@@ -444,7 +469,7 @@ static void drawFace(uint32_t now) {
     case MOUTH_ROUND: {
       int16_t r = s.mouthSize;
       // EATING chews: the mouth opens and shuts about twice a second.
-      if (e == EXP_EATING) r = 4 + abs(wave(now, 500, 3));
+      if (e == EXP_EATING) r = 4 + abs(wave(now, CHEW_PERIOD_MS, 3));
       drawMouthO(FACE_CX + gazePx / 2, mouthCy, r);
       break;
     }
@@ -457,15 +482,13 @@ static void drawFace(uint32_t now) {
   }
 
   // ---- per-expression props ----------------------------------------
-  switch (e) {
+  if (!holdClosed) switch (e) {
     case EXP_CONFUSED:
-      u8g2.setFont(u8g2_font_10x20_tf);
-      u8g2.drawStr(112, 20 + wave(now, 1200, 2), "?");
+      drawQuestion(112, 20 + wave(now, CONFUSED_BOB_MS, 2));
       break;
 
     case EXP_SLEEPY:
-      u8g2.setFont(u8g2_font_6x10_tf);
-      u8g2.drawStr(108, 20 - (int16_t)((now % 2000) * 8 / 2000), "z");
+      drawZ(108, 20 - (int16_t)((now % SLEEPY_Z_PERIOD_MS) * 8 / SLEEPY_Z_PERIOD_MS), 5, 1);
       break;
 
     case EXP_SLEEPING:
@@ -473,17 +496,17 @@ static void drawFace(uint32_t now) {
       break;
 
     case EXP_THIRSTY:
-      drawDroplet(119, 24 + wave(now, 900, 2));
+      drawDroplet(119, 24 + wave(now, THIRSTY_BOB_MS, 2));
       break;
 
     case EXP_CELEBRATE: {
       static const int8_t SPARK[4][2] = {{12, 12}, {116, 14}, {16, 58}, {112, 56}};
       for (uint8_t i = 0; i < 4; i++)
-        drawSparkle(SPARK[i][0], SPARK[i][1], 2 + abs(wave(now + i * 250, 1000, 2)));
+        drawSparkle(SPARK[i][0], SPARK[i][1], 2 + abs(wave(now + i * SPARKLE_STAGGER_MS, SPARKLE_PERIOD_MS, 2)));
       break;
     }
     case EXP_EATING:
-      drawMilkGlass(112, 46, wave(now, 1300, 3));
+      drawMilkGlass(112, 46, wave(now, MILK_TILT_PERIOD_MS, 3));
       break;
 
     default:

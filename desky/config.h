@@ -96,6 +96,10 @@
 #define OLED_CONTRAST_FULL  255      // normal brightness
 #define OLED_CONTRAST_DIM   8        // sleep mode brightness
 
+// Display B is pushed to the panel in slices so display A never stalls:
+// one frame is 8 pages, and only this many are sent per frame of display A.
+#define INFO_PAGES_PER_FRAME 2
+
 // Blinking. The interval is re-randomised after every blink so it never
 // looks mechanical.
 #define BLINK_MIN_MS        3000
@@ -127,6 +131,19 @@
 
 // Night mode multiplies every animation period by this, so Desky slows down
 #define NIGHT_SLOWDOWN      2
+
+// Periods of the small looping animations on the face (display A)
+#define CONFUSED_BOB_MS     1200     // the "?" floats up and down
+#define SLEEPY_Z_PERIOD_MS  2000     // the single "z" of SLEEPY drifts up
+#define ZZZ_PERIOD_MS       2400     // the three Zs of SLEEPING chase each other
+#define THIRSTY_BOB_MS      900      // water droplet bobs
+#define SPARKLE_PERIOD_MS   1000     // CELEBRATE sparkles pulse
+#define SPARKLE_STAGGER_MS  250      // each sparkle starts this much later
+#define MILK_TILT_PERIOD_MS 1300     // EATING: the milk glass tilts
+#define CHEW_PERIOD_MS      500      // EATING: mouth opens and shuts
+
+// Serial test tour (step 1 helper): how long each expression is shown
+#define TOUR_STEP_MS        2000
 
 // How long a one-off reaction face is shown before falling back to the
 // face that belongs to the current mode

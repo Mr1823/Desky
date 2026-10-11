@@ -1,16 +1,15 @@
 /*
  * Desky - a desk companion pet on a NodeMCU ESP-12E (ESP8266).
  *
- * ==== BUILD STEP 1 of 8 ====
- * I2C scan + display A (the face) with the full animation engine.
+ * ==== BUILD STEPS 1-2 of 8 ====
+ * I2C scan, display A (the face) and display B (the info panel).
  *
  * Desky has two OLEDs on the same two I2C wires, told apart by address:
  *   display A, 0x3C - the FACE. Only ever the face. No text, no numbers.
  *   display B, 0x3D - the INFO PANEL. Every word and digit lives there.
  *
- * Display B is build step 2, so for now anything that would be printed on
- * it is sent to the serial monitor instead, tagged [infoB]. That keeps the
- * rule intact: nothing but the face ever reaches display A.
+ * Display B lives in infopanel.cpp. If it is not connected, Desky runs on
+ * display A alone. Nothing but the face ever reaches display A.
  *
  * The touch sensor, buzzer, servo, NFC reader and Wi-Fi are not wired up in
  * code yet either, so every input is faked over serial. Open the serial
@@ -23,6 +22,7 @@
 #include <Wire.h>
 #include "config.h"
 #include "faces.h"
+#include "infopanel.h"
 
 // =====================================================================
 // MODES
@@ -39,6 +39,12 @@ static uint32_t modeStarted = 0;
 static uint32_t workStartedAt  = 0;
 static uint16_t glassesOfWater = 0;
 static uint16_t happiness      = 0;
+static uint32_t lastWaterAt    = 0;   // start of the current water countdown
+
+// MILK interrupts a mode for 4 s. These remember what it interrupted and
+// when that mode started, so BREAK's 5 minute clock is not restarted.
+static Mode     eatReturnMode  = MODE_IDLE;
+static uint32_t eatReturnStart = 0;
 
 // Which displays actually answered on the bus. Desky must run fully even
 // if display B is missing, so this is a flag and never an error.
@@ -47,6 +53,15 @@ static bool infoDisplayFound = false;
 
 // Night mode is faked with the "night" command until step 7 brings NTP in.
 static bool fakeNight = false;
+
+// Fake clock + weather so display B can be tested before Wi-Fi exists.
+// Step 7 replaces these with real NTP time.
+static bool     fakeTimeOn    = false;
+static uint16_t fakeBaseMin   = 0;     // minutes after midnight when "time" was typed
+static uint32_t fakeBaseMs    = 0;
+static bool     fakeWeatherOn = false;
+static int16_t  fakeTempC     = 0;
+static bool     holdEyes      = false; // the fake touch-hold toggle
 
 // FPS / debug
 static uint32_t lastFrameAt = 0;
@@ -93,26 +108,46 @@ static void scanI2C() {
 }
 
 // =====================================================================
-// DISPLAY B STAND-IN
+// FEEDING DISPLAY B
 // =====================================================================
-// Step 2 replaces every one of these calls with infopanel.cpp. Until then
-// they print to serial, so the info-panel behaviour can already be checked.
-static void infoShowMode(const char *name) {
-  Serial.print(F("[infoB] mode name \""));
-  Serial.print(name);
-  Serial.print(F("\" for "));
-  Serial.print(INFO_MODE_FLASH_MS / 1000);
-  Serial.println(F("s, then back to normal content"));
-}
+// While EATING, display B keeps showing whatever the interrupted mode
+// shows, so these two look straight through EATING to the real mode.
+static Mode     underlyingMode()  { return mode == MODE_EATING ? eatReturnMode  : mode; }
+static uint32_t underlyingStart() { return mode == MODE_EATING ? eatReturnStart : modeStarted; }
 
-static void infoShowSummary(uint32_t minutes, uint16_t glasses) {
-  Serial.print(F("[infoB] summary for 5s: "));
-  Serial.print(minutes);  Serial.print(F(" min worked, "));
-  Serial.print(glasses);  Serial.println(F(" glasses of water"));
-}
+// Collect "what is true right now" for infopanel.cpp. It decides what to
+// draw and whether anything changed - this function only reports facts.
+static void fillInfoInput(uint32_t now, InfoInput &in) {
+  memset(&in, 0, sizeof(in));
 
-static void infoShowClock() {
-  Serial.println(F("[infoB] clock for 3s (face on A unchanged)"));
+  switch (underlyingMode()) {
+    case MODE_WORK:  in.mode = INFO_WORK;  break;
+    case MODE_BREAK: in.mode = INFO_BREAK; break;
+    case MODE_SLEEP: in.mode = INFO_SLEEP; break;
+    default:         in.mode = INFO_IDLE;  break;
+  }
+
+  // clock (fake until step 7)
+  in.timeValid = fakeTimeOn;
+  if (fakeTimeOn) {
+    uint32_t minutes = (fakeBaseMin + (now - fakeBaseMs) / 60000UL) % 1440UL;
+    in.hour = minutes / 60;  in.minute = minutes % 60;
+    in.wday = 1;  in.mday = 22;  in.month = 9;      // a fixed example date: Mon, 22 Sep
+  }
+  in.weatherValid = fakeWeatherOn;
+  in.tempC        = fakeTempC;
+
+  // WORK
+  in.workSeconds = (now - workStartedAt) / 1000UL;
+  in.glasses     = glassesOfWater;
+  uint32_t sinceWater = now - lastWaterAt;
+  in.minsToWater = (sinceWater >= WATER_INTERVAL_MS) ? 0
+                 : (uint16_t)((WATER_INTERVAL_MS - sinceWater + 59999UL) / 60000UL);
+
+  // BREAK
+  uint32_t sinceBreak = now - underlyingStart();
+  in.breakSecondsLeft = (sinceBreak >= BREAK_DURATION_MS) ? 0
+                      : (BREAK_DURATION_MS - sinceBreak + 999UL) / 1000UL;
 }
 
 // =====================================================================
@@ -131,7 +166,7 @@ static Expression faceForMode(Mode m) {
   }
 }
 
-static void setMode(Mode m) {
+static void enterMode(Mode m, bool announce) {
   if (m != MODE_EATING && m != MODE_BREAK) modeBefore = m;
   mode        = m;
   modeStarted = millis();
@@ -143,8 +178,10 @@ static void setMode(Mode m) {
 
   Serial.print(F("[mode] -> "));
   Serial.println(MODE_NAMES[m]);
-  infoShowMode(MODE_NAMES[m]);
+  if (announce) infoFlashMode(MODE_NAMES[m]);   // display B shows the name for 2 s
 }
+
+static void setMode(Mode m) { enterMode(m, true); }
 
 // Each card tap, faked over serial for now. The real reader arrives in
 // step 6, but the behaviour here is already final.
@@ -153,12 +190,14 @@ static void onWorkCard() {
     // Tapping WORK again ends the session. The summary goes on display B;
     // the face celebrates on display A.
     uint32_t minutes = (millis() - workStartedAt) / 60000UL;
-    infoShowSummary(minutes, glassesOfWater);
+    uint16_t glasses = glassesOfWater;
     glassesOfWater = 0;
     setMode(MODE_IDLE);
+    infoShowSummary(minutes, glasses);   // after setMode, so it replaces the mode-name flash
     facesReact(EXP_CELEBRATE);
   } else {
     workStartedAt  = millis();
+    lastWaterAt    = workStartedAt;
     glassesOfWater = 0;
     setMode(MODE_WORK);
   }
@@ -171,7 +210,10 @@ static void onMilkCard() {
   // MILK does not change the mode. It plays an animation, then hands
   // control back to whatever Desky was doing before.
   happiness++;
-  modeBefore  = (mode == MODE_EATING) ? modeBefore : mode;
+  if (mode != MODE_EATING) {          // a second milk card must not overwrite what we remember
+    eatReturnMode  = mode;
+    eatReturnStart = modeStarted;
+  }
   mode        = MODE_EATING;
   modeStarted = millis();
   facesSetBase(EXP_EATING);
@@ -187,7 +229,8 @@ static void onUnknownCard() {
 // Time-based mode exits. No delay(), just deadline checks.
 static void updateModeTimers(uint32_t now) {
   if (mode == MODE_EATING && now - modeStarted >= EATING_DURATION_MS) {
-    setMode(modeBefore);
+    enterMode(eatReturnMode, false);   // quiet: EATING changes nothing on display B
+    modeStarted = eatReturnStart;      // BREAK keeps its original 5 minute clock
     facesReact(EXP_HAPPY);
   }
   else if (mode == MODE_BREAK && now - modeStarted >= BREAK_DURATION_MS) {
@@ -203,11 +246,12 @@ static void updateModeTimers(uint32_t now) {
 // are wired in over steps 3-8)
 // =====================================================================
 static void printHelp() {
-  Serial.println(F("\n--- Desky step 1: face test commands ---"));
+  Serial.println(F("\n--- Desky test commands ---"));
   Serial.println(F("faces : calm happy loved surprised confused sad"));
   Serial.println(F("        sleepy sleeping focus thirsty celebrate eating"));
   Serial.println(F("cards : work break sleep milk unknown idle  (work again ends session)"));
-  Serial.println(F("touch : tap hold annoy drank clock"));
+  Serial.println(F("touch : tap hold annoy drank clock   (hold = toggle eyes shut)"));
+  Serial.println(F("panel : time 14:05 | notime | weather 28 | noweather"));
   Serial.println(F("gaze  : left right centre free"));
   Serial.println(F("other : blink night day dim bright tour stop scan help"));
   Serial.println(F("----------------------------------------\n"));
@@ -232,6 +276,24 @@ static void handleCommand(String w) {
     return;
   }
 
+  // --- fake clock / weather for display B ---
+  if (w.startsWith("time ")) {
+    int c = w.indexOf(':');
+    int h = w.substring(5).toInt();
+    int m = (c > 0) ? w.substring(c + 1).toInt() : 0;
+    if (h < 0 || h > 23 || m < 0 || m > 59) { Serial.println(F("[?] use: time 14:05")); return; }
+    fakeBaseMin = h * 60 + m;  fakeBaseMs = millis();  fakeTimeOn = true;
+    Serial.print(F("[time] fake clock set to ")); Serial.println(w.substring(5));
+    return;
+  }
+  if (w.startsWith("weather ")) {
+    fakeTempC = w.substring(8).toInt();  fakeWeatherOn = true;
+    Serial.print(F("[weather] fake temperature ")); Serial.println(fakeTempC);
+    return;
+  }
+  if (w == "notime")    { fakeTimeOn    = false; Serial.println(F("[time] clock off"));    return; }
+  if (w == "noweather") { fakeWeatherOn = false; Serial.println(F("[weather] off"));      return; }
+
   // --- faked card taps ---
   if      (w == "work")     onWorkCard();
   else if (w == "break")    onBreakCard();
@@ -242,12 +304,13 @@ static void handleCommand(String w) {
 
   // --- faked touch reactions (real sensor in step 3) ---
   else if (w == "tap")      { facesReact(EXP_LOVED);  Serial.println(F("[touch] single tap -> LOVED")); }
-  else if (w == "hold")     { facesReactFor(EXP_SLEEPING, 2000);
-                              Serial.println(F("[touch] hold -> eyes close")); }
+  else if (w == "hold")     { holdEyes = !holdEyes;  facesHoldEyesClosed(holdEyes);
+                              Serial.println(holdEyes ? F("[touch] hold -> eyes shut (type hold again to release)")
+                                                      : F("[touch] released")); }
   else if (w == "annoy")    { facesReact(EXP_CONFUSED); Serial.println(F("[touch] 5 fast taps -> annoyed")); }
-  else if (w == "drank")    { glassesOfWater++; facesReact(EXP_HAPPY);
+  else if (w == "drank")    { glassesOfWater++; lastWaterAt = millis(); facesReact(EXP_HAPPY);
                               Serial.print(F("[water] glasses=")); Serial.println(glassesOfWater); }
-  else if (w == "clock")    infoShowClock();      // double tap: display B only
+  else if (w == "clock")    infoPeekClock();      // double tap: display B only
 
   // --- gaze, which the servo will drive for real in step 5 ---
   else if (w == "left")     facesSetGaze(-1);
@@ -265,7 +328,8 @@ static void handleCommand(String w) {
   else if (w == "bright")   facesSetDim(false);
   else if (w == "tour")     { tourRunning = true; tourIndex = 0; tourNextAt = 0;
                               Serial.println(F("[tour] showing every expression, 2 s each")); }
-  else if (w == "stop")     { tourRunning = false; facesClearReaction(); }
+  else if (w == "stop")     { tourRunning = false; facesClearReaction();
+                              holdEyes = false; facesHoldEyesClosed(false); }
   else if (w == "scan")     scanI2C();
   else if (w == "help" || w == "?") printHelp();
   else { Serial.print(F("[?] unknown command: ")); Serial.println(w); }
@@ -288,7 +352,7 @@ static void updateTour(uint32_t now) {
   facesClearReaction();
   Serial.print(F("[tour] ")); Serial.println(facesName(e));
   tourIndex++;
-  tourNextAt = now + 2000;
+  tourNextAt = now + TOUR_STEP_MS;
 }
 
 // =====================================================================
@@ -306,6 +370,7 @@ static void updateDebug(uint32_t now) {
   Serial.print(F(" heap="));       Serial.print(ESP.getFreeHeap());
   Serial.print(F(" water="));      Serial.print(glassesOfWater);
   Serial.print(F(" dispB="));      Serial.print(infoDisplayFound ? F("yes") : F("no"));
+  Serial.print(F(" drawsB="));     Serial.print(infoDrawCount());   // total real redraws of B
   if (mode == MODE_WORK) {
     Serial.print(F(" worked="));
     Serial.print((millis() - workStartedAt) / 60000UL);
@@ -319,7 +384,7 @@ static void updateDebug(uint32_t now) {
 // =====================================================================
 void setup() {
   Serial.begin(SERIAL_BAUD);
-  Serial.println(F("\n\nDesky booting - step 1, I2C scan + face engine"));
+  Serial.println(F("\n\nDesky booting - step 2, face + info panel"));
 
   // IMPORTANT: GPIO0 (buzzer) and GPIO2 (RC522 chip select) are boot-strap
   // pins and are deliberately left untouched here. They are configured in
@@ -331,7 +396,8 @@ void setup() {
   Wire.setClock(OLED_I2C_CLOCK_HZ);
   scanI2C();
 
-  facesBegin();            // display A only
+  facesBegin();                       // display A
+  infoBegin(infoDisplayFound);        // display B (skipped cleanly if absent)
   setMode(MODE_IDLE);
   printHelp();
 }
@@ -344,12 +410,22 @@ void loop() {
   updateModeTimers(now);
   facesUpdate(now);               // blink / glance / breathe timers
 
+  // Display B: only build and compare a new screen when it is allowed to
+  // change (at most once a second). infoUpdate() draws nothing if the
+  // content is the same as last time.
+  if (infoDue(now)) {
+    InfoInput in;
+    fillInfoInput(now, in);
+    infoUpdate(now, in);
+  }
+
   // Display A redraws on a fixed interval. Display B, once it exists, will
   // redraw at most once a second and only when its content has changed.
   if (now - lastFrameAt >= FRAME_INTERVAL_MS) {
     lastFrameAt = now;
     facesRender();
     frameCount++;
+    infoFlushStep();                // a slice of display B's new picture, if one is pending
   }
 
   updateDebug(now);

@@ -66,6 +66,7 @@ void facesSetLively(bool on);     // BREAK mode: blink/glance more, bounce
 void facesSetSlow(bool on);       // after 22:00: everything slower
 void facesSetDim(bool on);        // SLEEP mode: dim the panel
 void facesForceBlink();           // used by the "eyes closed" touch hold
+void facesHoldEyesClosed(bool on); // eyes shut and held, plain face, no Zs
 
 // ---- per-loop work --------------------------------------------------
 void facesUpdate(uint32_t now);   // advance timers. Call every loop.

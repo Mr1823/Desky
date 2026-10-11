@@ -203,8 +203,9 @@ Each step is finished and compiling before the next one starts.
 
 - [x] **1. I2C scan + display A: the full face and animation engine.**
       Inputs faked over serial.
-- [ ] 2. Display B, the info panel, with the change-detection redraw rule.
-      Confirm display A's frame rate did not drop.
+- [x] **2. Display B, the info panel, with the change-detection redraw rule.**
+      Code done. On your board, compare `fpsA` in the serial debug line with
+      and without display B connected - it should not drop.
 - [ ] 3. Touch sensor and all touch reactions
 - [ ] 4. Buzzer and all sounds
 - [ ] 5. Servo and all gestures, with the `detach()` rule
@@ -212,17 +213,18 @@ Each step is finished and compiling before the next one starts.
 - [ ] 7. Wi-Fi, NTP, night behaviour
 - [ ] 8. Water reminder, session tracking, summary screen
 
-## 12. Testing step 1 over serial
+## 12. Testing over serial
 
-Only display A needs to be connected. Open the serial monitor at 115200 baud
-and type `help`. Anything that would appear on display B is printed to serial
-tagged `[infoB]` until step 2 exists.
+Display A is enough to start; display B is optional (without it, `[infoB]`
+lines in the serial monitor tell you what it would have shown). Open the
+serial monitor at 115200 baud and type `help`.
 
 | Type | Commands |
 |---|---|
 | Faces | `calm happy loved surprised confused sad sleepy sleeping focus thirsty celebrate eating` |
 | Cards | `work` `break` `sleep` `milk` `unknown` `idle` — `work` again ends the session |
-| Touch | `tap` `hold` `annoy` `drank` `clock` |
+| Touch | `tap` `hold` (toggles eyes shut) `annoy` `drank` `clock` |
+| Display B | `time 14:05` `notime` `weather 28` `noweather` (fake clock/weather until step 7) |
 | Gaze | `left` `right` `centre` `free` |
 | Other | `blink` `night` `day` `dim` `bright` `tour` `stop` `scan` `help` |
 
@@ -240,8 +242,11 @@ At boot you should see:
 and once per second:
 
 ```
-[dbg] mode=WORK face=FOCUS fpsA=33 heap=43112 water=0 dispB=yes worked=3min
+[dbg] mode=WORK face=FOCUS fpsA=33 heap=43112 water=0 dispB=yes drawsB=212 worked=3min
 ```
+
+`drawsB` counts real redraws of display B. Leave Desky in IDLE with a fixed
+`time` and it stays flat; in WORK it goes up by about 1 per second.
 
 ---
 
@@ -252,10 +257,14 @@ and once per second:
   throwaway sketches in `tools/` do use `delay()` — they are not Desky.)
 - **20+ FPS on display A.** U8g2 runs in full buffer mode at a 400 kHz I2C
   clock, and the frame is pushed in one burst every 30 ms.
-- **Display B only redraws on change**, at most once a second.
+- **Display B only redraws on change**, at most once a second. The last
+  drawn screen is stored as a small struct and compared first. A redraw is
+  drawn into RAM at once but sent to the panel two pages per frame, so it
+  never causes one slow frame on display A.
 - **The NFC reader is polled every 200 ms**, never every loop.
 - **`servo.detach()` whenever the head is still.** The Servo library eats
   timer cycles and makes the animation stutter if it stays attached.
 - **Wi-Fi never blocks.** If it cannot connect, Desky works fully, just
   without the clock.
-- **Display A never shows text.** The face module has no text function.
+- **Display A never shows text.** `faces.cpp` calls no font or text
+  function at all; the "?" and the Zs are drawn from lines.
