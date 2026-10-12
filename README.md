@@ -131,6 +131,7 @@ desky/
   config.h         pins, addresses, wifi creds, card UIDs, timings
   faces.h/.cpp     face drawing + animation engine      (display A)
   infopanel.h/.cpp info screen + change detection       (display B, step 2)
+  touch.h/.cpp     TTP223 touch: debounce, tap/hold     (step 3)
   gestures.h/.cpp  servo moves: nod, shake, tilt, droop, wiggle  (step 5)
   sounds.h/.cpp    buzzer tunes                                  (step 4)
   cards.h/.cpp     NFC read, UID to card-name mapping            (step 6)
@@ -206,7 +207,7 @@ Each step is finished and compiling before the next one starts.
 - [x] **2. Display B, the info panel, with the change-detection redraw rule.**
       Code done. On your board, compare `fpsA` in the serial debug line with
       and without display B connected - it should not drop.
-- [ ] 3. Touch sensor and all touch reactions
+- [x] 3. Touch sensor and all touch reactions
 - [ ] 4. Buzzer and all sounds
 - [ ] 5. Servo and all gestures, with the `detach()` rule
 - [ ] 6. NFC reading, the card table, mode switching

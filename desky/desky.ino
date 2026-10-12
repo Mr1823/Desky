@@ -1,8 +1,8 @@
 /*
  * Desky - a desk companion pet on a NodeMCU ESP-12E (ESP8266).
  *
- * ==== BUILD STEPS 1-2 of 8 ====
- * I2C scan, display A (the face) and display B (the info panel).
+ * ==== BUILD STEPS 1-3 of 8 ====
+ * I2C scan, display A (the face), display B (the info panel), touch sensor.
  *
  * Desky has two OLEDs on the same two I2C wires, told apart by address:
  *   display A, 0x3C - the FACE. Only ever the face. No text, no numbers.
@@ -11,9 +11,13 @@
  * Display B lives in infopanel.cpp. If it is not connected, Desky runs on
  * display A alone. Nothing but the face ever reaches display A.
  *
- * The touch sensor, buzzer, servo, NFC reader and Wi-Fi are not wired up in
- * code yet either, so every input is faked over serial. Open the serial
- * monitor at 115200 baud and type "help".
+ * The TTP223 touch sensor is live (touch.cpp): single tap, double tap,
+ * 5-tap annoy, 2 s hold, 300 ms ack (water reminder priority rule).
+ * Serial commands remain as test overrides.
+ *
+ * The buzzer, servo, NFC reader and Wi-Fi are not wired up in code yet,
+ * so those inputs are still faked over serial. Open the serial monitor at
+ * 115200 baud and type "help".
  *
  * Golden rules (the long version is in config.h):
  *   - no delay() anywhere, every timer is a millis() deadline
@@ -23,6 +27,7 @@
 #include "config.h"
 #include "faces.h"
 #include "infopanel.h"
+#include "touch.h"
 
 // =====================================================================
 // MODES
@@ -61,7 +66,6 @@ static uint16_t fakeBaseMin   = 0;     // minutes after midnight when "time" was
 static uint32_t fakeBaseMs    = 0;
 static bool     fakeWeatherOn = false;
 static int16_t  fakeTempC     = 0;
-static bool     holdEyes      = false; // the fake touch-hold toggle
 
 // FPS / debug
 static uint32_t lastFrameAt = 0;
@@ -73,6 +77,14 @@ static uint16_t fps         = 0;
 static bool     tourRunning = false;
 static uint8_t  tourIndex   = 0;
 static uint32_t tourNextAt  = 0;
+
+// Touch-hold: eyes stay shut while the finger is on the pad
+static bool     holdEyesActive = false;
+
+// Water reminder active flag. The real logic arrives in step 8; this is here
+// so the touch handler can check it when deciding whether TOUCH_ACK means
+// "I drank the water" (priority rule) or should be ignored.
+static bool     waterNagging = false;
 
 // =====================================================================
 // I2C SCAN
@@ -242,15 +254,80 @@ static void updateModeTimers(uint32_t now) {
 }
 
 // =====================================================================
-// SERIAL FAKE INPUTS  (this whole section disappears as the real sensors
-// are wired in over steps 3-8)
+// TOUCH EVENT HANDLER
+// =====================================================================
+// Called for real sensor events AND for serial test overrides.
+static void onTouchEvent(TouchEvent ev) {
+  if (ev == TOUCH_NONE) return;
+
+  // PRIORITY RULE (step 8): while a water reminder is active, a 300 ms
+  // hold means "I drank the water" and wins over every other touch.
+  if (ev == TOUCH_ACK && waterNagging) {
+    glassesOfWater++;
+    lastWaterAt = millis();
+    waterNagging = false;
+    facesReact(EXP_HAPPY);
+    Serial.print(F("[water] drank! glasses="));
+    Serial.println(glassesOfWater);
+    // Sound and servo come in steps 4-5.
+    return;
+  }
+
+  switch (ev) {
+    case TOUCH_TAP:
+      // Single tap -> LOVED face. Purr sound and servo wiggle come later.
+      facesReact(EXP_LOVED);
+      Serial.println(F("[touch] single tap -> LOVED (purr + wiggle: steps 4-5)"));
+      break;
+
+    case TOUCH_DOUBLE:
+      // Double tap -> show the clock on display B for 3 s.
+      // The face on A does NOT change.
+      infoPeekClock();
+      Serial.println(F("[touch] double tap -> clock on B for 3s"));
+      break;
+
+    case TOUCH_ANNOY:
+      // 5 fast taps -> annoyed! Head shake and low beep later.
+      facesReact(EXP_CONFUSED);
+      Serial.println(F("[touch] 5 taps -> annoyed! (beep + shake: steps 4-5)"));
+      break;
+
+    case TOUCH_HOLD:
+      // 2 s hold -> eyes close, head leans toward the hand.
+      holdEyesActive = true;
+      facesHoldEyesClosed(true);
+      Serial.println(F("[touch] hold -> eyes shut (lean: step 5)"));
+      break;
+
+    case TOUCH_RELEASE:
+      // End of a hold -> open eyes, release lean.
+      holdEyesActive = false;
+      facesHoldEyesClosed(false);
+      Serial.println(F("[touch] released -> eyes open"));
+      break;
+
+    case TOUCH_ACK:
+      // ACK without an active water reminder: ignored (not a tap, not a hold yet).
+      // Just log it so the developer can see the event.
+      Serial.println(F("[touch] ack (300ms) - no water reminder active, ignored"));
+      break;
+
+    default:
+      break;
+  }
+}
+
+// =====================================================================
+// SERIAL TEST COMMANDS  (real touch is active; serial commands remain as
+// overrides for testing without the board. Cards, Wi-Fi etc still faked.)
 // =====================================================================
 static void printHelp() {
   Serial.println(F("\n--- Desky test commands ---"));
   Serial.println(F("faces : calm happy loved surprised confused sad"));
   Serial.println(F("        sleepy sleeping focus thirsty celebrate eating"));
   Serial.println(F("cards : work break sleep milk unknown idle  (work again ends session)"));
-  Serial.println(F("touch : tap hold annoy drank clock   (hold = toggle eyes shut)"));
+  Serial.println(F("touch : tap hold annoy drank clock   (serial overrides for the real sensor)"));
   Serial.println(F("panel : time 14:05 | notime | weather 28 | noweather"));
   Serial.println(F("gaze  : left right centre free"));
   Serial.println(F("other : blink night day dim bright tour stop scan help"));
@@ -302,15 +379,12 @@ static void handleCommand(String w) {
   else if (w == "unknown")  onUnknownCard();
   else if (w == "idle")     setMode(MODE_IDLE);
 
-  // --- faked touch reactions (real sensor in step 3) ---
-  else if (w == "tap")      { facesReact(EXP_LOVED);  Serial.println(F("[touch] single tap -> LOVED")); }
-  else if (w == "hold")     { holdEyes = !holdEyes;  facesHoldEyesClosed(holdEyes);
-                              Serial.println(holdEyes ? F("[touch] hold -> eyes shut (type hold again to release)")
-                                                      : F("[touch] released")); }
-  else if (w == "annoy")    { facesReact(EXP_CONFUSED); Serial.println(F("[touch] 5 fast taps -> annoyed")); }
-  else if (w == "drank")    { glassesOfWater++; lastWaterAt = millis(); facesReact(EXP_HAPPY);
-                              Serial.print(F("[water] glasses=")); Serial.println(glassesOfWater); }
-  else if (w == "clock")    infoPeekClock();      // double tap: display B only
+  // --- serial touch overrides (route through the shared handler) ---
+  else if (w == "tap")      onTouchEvent(TOUCH_TAP);
+  else if (w == "hold")     { onTouchEvent(holdEyesActive ? TOUCH_RELEASE : TOUCH_HOLD); }
+  else if (w == "annoy")    onTouchEvent(TOUCH_ANNOY);
+  else if (w == "drank")    { waterNagging = true; onTouchEvent(TOUCH_ACK); }
+  else if (w == "clock")    onTouchEvent(TOUCH_DOUBLE);
 
   // --- gaze, which the servo will drive for real in step 5 ---
   else if (w == "left")     facesSetGaze(-1);
@@ -329,7 +403,7 @@ static void handleCommand(String w) {
   else if (w == "tour")     { tourRunning = true; tourIndex = 0; tourNextAt = 0;
                               Serial.println(F("[tour] showing every expression, 2 s each")); }
   else if (w == "stop")     { tourRunning = false; facesClearReaction();
-                              holdEyes = false; facesHoldEyesClosed(false); }
+                              holdEyesActive = false; facesHoldEyesClosed(false); }
   else if (w == "scan")     scanI2C();
   else if (w == "help" || w == "?") printHelp();
   else { Serial.print(F("[?] unknown command: ")); Serial.println(w); }
@@ -384,7 +458,7 @@ static void updateDebug(uint32_t now) {
 // =====================================================================
 void setup() {
   Serial.begin(SERIAL_BAUD);
-  Serial.println(F("\n\nDesky booting - step 2, face + info panel"));
+  Serial.println(F("\n\nDesky booting - step 3, face + info panel + touch"));
 
   // IMPORTANT: GPIO0 (buzzer) and GPIO2 (RC522 chip select) are boot-strap
   // pins and are deliberately left untouched here. They are configured in
@@ -398,6 +472,7 @@ void setup() {
 
   facesBegin();                       // display A
   infoBegin(infoDisplayFound);        // display B (skipped cleanly if absent)
+  touchBegin();                       // TTP223 on PIN_TOUCH
   setMode(MODE_IDLE);
   printHelp();
 }
@@ -406,6 +481,7 @@ void loop() {
   uint32_t now = millis();
 
   handleSerial();
+  onTouchEvent(touchUpdate(now));    // real TTP223 sensor
   updateTour(now);
   updateModeTimers(now);
   facesUpdate(now);               // blink / glance / breathe timers
